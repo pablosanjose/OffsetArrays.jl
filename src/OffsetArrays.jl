@@ -1,19 +1,15 @@
-__precompile__()
+VERSION < v"0.7.0-beta2.199" && __precompile__()
 
 module OffsetArrays
 
-using Base: Indices, tail
-using Compat
-
-export OffsetArray, OffsetVector, @unsafe
-
-# TODO: just use .+
-# See https://github.com/JuliaLang/julia/pull/22932#issuecomment-330711997
-if VERSION < v"0.7.0-DEV.1759"
-    plus(r::AbstractUnitRange, i::Integer) = r + i
+using Base: Indices, tail, @propagate_inbounds
+@static if !isdefined(Base, :IdentityUnitRange)
+    const IdentityUnitRange = Base.Slice
 else
-    plus(r::AbstractUnitRange, i::Integer) = broadcast(+, r, i)
+    using Base: IdentityUnitRange
 end
+
+export OffsetArray, OffsetVector
 
 struct OffsetArray{T,N,AA<:AbstractArray} <: AbstractArray{T,N}
     parent::AA
@@ -26,27 +22,37 @@ OffsetArray(A::AbstractArray{T,N}, offsets::NTuple{N,Int}) where {T,N} =
 OffsetArray(A::AbstractArray{T,N}, offsets::Vararg{Int,N}) where {T,N} =
     OffsetArray(A, offsets)
 
-OffsetArray{T,N}(inds::Indices{N}) where {T,N} =
-    OffsetArray{T,N,Array{T,N}}(Array{T,N}(map(length, inds)), map(indexoffset, inds))
-OffsetArray{T}(inds::Indices{N}) where {T,N} = OffsetArray{T,N}(inds)
-OffsetArray{T,N}(inds::Vararg{AbstractUnitRange,N}) where {T,N} = OffsetArray{T,N}(inds)
-OffsetArray{T}(inds::Vararg{AbstractUnitRange,N}) where {T,N} = OffsetArray{T,N}(inds)
+const ArrayInitializer = Union{UndefInitializer, Missing, Nothing}
+OffsetArray{T,N}(init::ArrayInitializer, inds::Indices{N}) where {T,N} =
+    OffsetArray{T,N,Array{T,N}}(Array{T,N}(init, map(indexlength, inds)), map(indexoffset, inds))
+OffsetArray{T}(init::ArrayInitializer, inds::Indices{N}) where {T,N} = OffsetArray{T,N}(init, inds)
+OffsetArray{T,N}(init::ArrayInitializer, inds::Vararg{AbstractUnitRange,N}) where {T,N} = OffsetArray{T,N}(init, inds)
+OffsetArray{T}(init::ArrayInitializer, inds::Vararg{AbstractUnitRange,N}) where {T,N} = OffsetArray{T,N}(init, inds)
 OffsetArray(A::AbstractArray{T,0}) where {T} = OffsetArray{T,0,typeof(A)}(A, ())
-OffsetArray(::Type{T}, inds::Vararg{UnitRange{Int},N}) where {T,N} = OffsetArray{T,N}(inds)
 
 # OffsetVector constructors
 OffsetVector(A::AbstractVector, offset) = OffsetArray(A, offset)
-OffsetVector(::Type{T}, inds::AbstractUnitRange) where {T} = OffsetArray{T,1}(inds)
-OffsetVector{T}(inds::AbstractUnitRange) where {T} = OffsetArray{T}(inds)
+OffsetVector{T}(init::ArrayInitializer, inds::AbstractUnitRange) where {T} = OffsetArray{T}(init, inds)
+
+# deprecated constructors
+using Base: @deprecate
+
+@deprecate OffsetArray(::Type{T}, inds::Vararg{UnitRange{Int},N}) where {T,N} OffsetArray{T}(undef, inds)
+@deprecate OffsetVector(::Type{T}, inds::AbstractUnitRange) where {T} OffsetVector{T}(undef, inds)
+@deprecate OffsetArray{T,N}(inds::Indices{N}) where {T,N} OffsetArray{T,N}(undef, inds)
+@deprecate OffsetArray{T}(inds::Indices{N}) where {T,N} OffsetArray{T}(undef, inds)
+@deprecate OffsetArray{T,N}(inds::Vararg{AbstractUnitRange,N}) where {T,N} OffsetArray{T,N}(undef, inds)
+@deprecate OffsetArray{T}(inds::Vararg{AbstractUnitRange,N}) where {T,N} OffsetArray{T}(undef, inds)
+@deprecate OffsetVector{T}(inds::AbstractUnitRange) where {T} OffsetVector{T}(undef, inds)
 
 # The next two are necessary for ambiguity resolution. Really, the
 # second method should not be necessary.
 OffsetArray(A::AbstractArray{T,0}, inds::Tuple{}) where {T} = OffsetArray{T,0,typeof(A)}(A, ())
 OffsetArray(A::AbstractArray{T,N}, inds::Tuple{}) where {T,N} = error("this should never be called")
 function OffsetArray(A::AbstractArray{T,N}, inds::NTuple{N,AbstractUnitRange}) where {T,N}
-    lA = map(length, indices(A))
-    lI = map(length, inds)
-    lA == lI || throw(DimensionMismatch("supplied indices do not agree with the size of the array (got size $lA for the array and $lI for the indices"))
+    lA = map(indexlength, axes(A))
+    lI = map(indexlength, inds)
+    lA == lI || throw(DimensionMismatch("supplied axes do not agree with the size of the array (got size $lA for the array and $lI for the indices"))
     OffsetArray(A, map(indexoffset, inds))
 end
 OffsetArray(A::AbstractArray{T,N}, inds::Vararg{AbstractUnitRange,N}) where {T,N} =
@@ -58,73 +64,88 @@ parenttype(A::OffsetArray) = parenttype(typeof(A))
 
 Base.parent(A::OffsetArray) = A.parent
 
-errmsg(A) = error("size not supported for arrays with indices $(indices(A)); see http://docs.julialang.org/en/latest/devdocs/offset-arrays/")
-Base.size(A::OffsetArray) = errmsg(A)
-Base.size(A::OffsetArray, d) = errmsg(A)
-Base.eachindex(::IndexCartesian, A::OffsetArray) = CartesianRange(indices(A))
-Base.eachindex(::IndexLinear, A::OffsetVector)   = indices(A, 1)
+Base.eachindex(::IndexCartesian, A::OffsetArray) = CartesianIndices(axes(A))
+Base.eachindex(::IndexLinear, A::OffsetVector)   = axes(A, 1)
 
-# Implementations of indices and indices1. Since bounds-checking is
-# performance-critical and relies on indices, these are usually worth
+Base.size(A::OffsetArray) = size(parent(A))
+Base.size(A::OffsetArray, d) = size(parent(A), d)
+
+# Implementations of axes and indices1. Since bounds-checking is
+# performance-critical and relies on axes, these are usually worth
 # optimizing thoroughly.
-@inline Base.indices(A::OffsetArray, d) =
-    1 <= d <= length(A.offsets) ? plus(indices(parent(A))[d], A.offsets[d]) : (1:1)
-@inline Base.indices(A::OffsetArray) =
-    _indices(indices(parent(A)), A.offsets)  # would rather use ntuple, but see #15276
-@inline _indices(inds, offsets) =
-    (plus(inds[1], offsets[1]), _indices(tail(inds), tail(offsets))...)
-_indices(::Tuple{}, ::Tuple{}) = ()
-Base.indices1(A::OffsetArray{T,0}) where {T} = 1:1  # we only need to specialize this one
+@inline Base.axes(A::OffsetArray, d) =
+    1 <= d <= length(A.offsets) ? _slice(axes(parent(A))[d], A.offsets[d]) : (1:1)
+@inline Base.axes(A::OffsetArray) =
+    _axes(axes(parent(A)), A.offsets)  # would rather use ntuple, but see #15276
+@inline _axes(inds, offsets) =
+    (_slice(inds[1], offsets[1]), _axes(tail(inds), tail(offsets))...)
+_axes(::Tuple{}, ::Tuple{}) = ()
+Base.axes1(A::OffsetArray{T,0}) where {T} = 1:1  # we only need to specialize this one
 
+# Avoid the kw-arg on the range(r+x, length=length(r)) call in r .+ x
+@inline _slice(r, x) = IdentityUnitRange(Base._range(first(r) + x, nothing, nothing, length(r)))
+
+const OffsetAxis = Union{Integer, UnitRange, Base.OneTo, IdentityUnitRange}
 function Base.similar(A::OffsetArray, ::Type{T}, dims::Dims) where T
     B = similar(parent(A), T, dims)
 end
-function Base.similar(A::AbstractArray, ::Type{T}, inds::Tuple{UnitRange,Vararg{UnitRange}}) where T
-    B = similar(A, T, map(length, inds))
+function Base.similar(A::AbstractArray, ::Type{T}, inds::Tuple{OffsetAxis,Vararg{OffsetAxis}}) where T
+    B = similar(A, T, map(indexlength, inds))
     OffsetArray(B, map(indexoffset, inds))
 end
 
-Base.similar(f::Union{Function,Type}, shape::Tuple{UnitRange,Vararg{UnitRange}}) =
-    OffsetArray(f(map(length, shape)), map(indexoffset, shape))
+Base.reshape(A::AbstractArray, inds::Tuple{OffsetAxis,Vararg{OffsetAxis}}) =
+    OffsetArray(reshape(A, map(indexlength, inds)), map(indexoffset, inds))
 
-Base.reshape(A::AbstractArray, inds::Tuple{UnitRange,Vararg{UnitRange}}) =
-    OffsetArray(reshape(A, map(length, inds)), map(indexoffset, inds))
+# Reshaping OffsetArrays can "pop" the original OffsetArray wrapper and return
+# an OffsetArray(reshape(...)) instead of an OffsetArray(reshape(OffsetArray(...)))
+Base.reshape(A::OffsetArray, inds::Tuple{OffsetAxis,Vararg{OffsetAxis}}) =
+    OffsetArray(reshape(parent(A), map(indexlength, inds)), map(indexoffset, inds))
+# And for non-offset axes, we can just return a reshape of the parent directly
+Base.reshape(A::OffsetArray, inds::Tuple{Union{Integer,Base.OneTo},Vararg{Union{Integer,Base.OneTo}}}) = reshape(parent(A), inds)
+Base.reshape(A::OffsetArray, inds::Dims) = reshape(parent(A), inds)
 
-Base.reshape(A::OffsetArray, inds::Tuple{UnitRange,Vararg{UnitRange}}) =
-    OffsetArray(reshape(parent(A), map(length, inds)), map(indexoffset, inds))
+Base.similar(::Type{T}, shape::Tuple{OffsetAxis,Vararg{OffsetAxis}}) where {T<:AbstractArray} =
+    OffsetArray(T(undef, map(indexlength, shape)), map(indexoffset, shape))
 
-function Base.reshape(A::OffsetArray, inds::Tuple{UnitRange,Vararg{Union{UnitRange,Int,Base.OneTo}}})
-    throw(ArgumentError("reshape must supply UnitRange indices, got $(typeof(inds)).\n       Note that reshape(A, Val{N}) is not supported for OffsetArrays."))
-end
+Base.fill(v, inds::NTuple{N, Union{Integer, AbstractUnitRange}}) where {N} =
+    fill!(OffsetArray(Array{typeof(v), N}(undef, map(indexlength, inds)), map(indexoffset, inds)), v)
+Base.zeros(::Type{T}, inds::NTuple{N, Union{Integer, AbstractUnitRange}}) where {T, N} =
+    fill!(OffsetArray(Array{T, N}(undef, map(indexlength, inds)), map(indexoffset, inds)), zero(T))
+Base.ones(::Type{T}, inds::NTuple{N, Union{Integer, AbstractUnitRange}}) where {T, N} =
+    fill!(OffsetArray(Array{T, N}(undef, map(indexlength, inds)), map(indexoffset, inds)), one(T))
+Base.trues(inds::NTuple{N, Union{Integer, AbstractUnitRange}}) where {N} =
+    fill!(OffsetArray(BitArray{N}(undef, map(indexlength, inds)), map(indexoffset, inds)), true)
+Base.falses(inds::NTuple{N, Union{Integer, AbstractUnitRange}}) where {N} =
+    fill!(OffsetArray(BitArray{N}(undef, map(indexlength, inds)), map(indexoffset, inds)), false)
 
-# Don't allow bounds-checks to be removed during Julia 0.5
-@inline function Base.getindex(A::OffsetArray{T,N}, I::Vararg{Int,N}) where {T,N}
-    checkbounds(A, I...)
+@inline @propagate_inbounds function Base.getindex(A::OffsetArray{T,N}, I::Vararg{Int,N}) where {T,N}
+    @boundscheck checkbounds(A, I...)
     @inbounds ret = parent(A)[offset(A.offsets, I)...]
     ret
 end
-@inline function Base.getindex(A::OffsetVector, i::Int)
-    checkbounds(A, i)
+@inline @propagate_inbounds function Base.getindex(A::OffsetVector, i::Int)
+    @boundscheck checkbounds(A, i)
     @inbounds ret = parent(A)[offset(A.offsets, (i,))[1]]
     ret
 end
-@inline function Base.getindex(A::OffsetArray, i::Int)
-    checkbounds(A, i)
+@inline @propagate_inbounds function Base.getindex(A::OffsetArray, i::Int)
+    @boundscheck checkbounds(A, i)
     @inbounds ret = parent(A)[i]
     ret
 end
-@inline function Base.setindex!(A::OffsetArray{T,N}, val, I::Vararg{Int,N}) where {T,N}
-    checkbounds(A, I...)
+@inline @propagate_inbounds function Base.setindex!(A::OffsetArray{T,N}, val, I::Vararg{Int,N}) where {T,N}
+    @boundscheck checkbounds(A, I...)
     @inbounds parent(A)[offset(A.offsets, I)...] = val
     val
 end
-@inline function Base.setindex!(A::OffsetVector, val, i::Int)
-    checkbounds(A, i)
+@inline @propagate_inbounds function Base.setindex!(A::OffsetVector, val, i::Int)
+    @boundscheck checkbounds(A, i)
     @inbounds parent(A)[offset(A.offsets, (i,))[1]] = val
     val
 end
-@inline function Base.setindex!(A::OffsetArray, val, i::Int)
-    checkbounds(A, i)
+@inline @propagate_inbounds function Base.setindex!(A::OffsetArray, val, i::Int)
+    @boundscheck checkbounds(A, i)
     @inbounds parent(A)[i] = val
     val
 end
@@ -132,8 +153,10 @@ end
 ### Convenience functions ###
 
 Base.fill(x, inds::Tuple{UnitRange,Vararg{UnitRange}}) =
-    fill!(OffsetArray{typeof(x)}(inds), x)
+    fill!(OffsetArray{typeof(x)}(undef, inds), x)
 @inline Base.fill(x, ind1::UnitRange, inds::UnitRange...) = fill(x, (ind1, inds...))
+
+Base.resize!(A::OffsetVector, nl::Integer) = (resize!(A.parent, nl); A)
 
 ### Low-level utilities ###
 
@@ -149,95 +172,25 @@ offset(offsets::Tuple{Vararg{Int}}, inds::Tuple{}) = error("inds cannot be short
 
 indexoffset(r::AbstractRange) = first(r) - 1
 indexoffset(i::Integer) = 0
+indexlength(r::AbstractRange) = length(r)
+indexlength(i::Integer) = i
 
-macro unsafe(ex)
-    esc(unsafe(ex))
-end
-unsafe(ex) = ex
-function unsafe(ex::Expr)
-    if ex.head ∈ (:+=, :-=, :*=, :/=)
-        ex = Expr(:(=), ex.args[1], Expr(:call, Symbol(string(ex.head)[1]), ex.args...))
+@eval @deprecate $(Symbol("@unsafe")) $(Symbol("@inbounds"))
+
+function Base.showarg(io::IO, a::OffsetArray, toplevel)
+    print(io, "OffsetArray(")
+    Base.showarg(io, parent(a), false)
+    if ndims(a) > 0
+        print(io, ", ")
+        printindices(io, axes(a)...)
     end
-    if ex.head == :(=)
-        a = ex.args[1]
-        if isa(a, Expr) && (a::Expr).head == :ref
-            # setindex!
-            newargs = map(unsafe, ex.args[2:end])
-            @assert length(newargs) == 1
-            return Expr(:call, :(OffsetArrays.unsafe_setindex!), (a::Expr).args[1], newargs[1], (a::Expr).args[2:end]...)
-        end
-    end
-    newargs = map(unsafe, ex.args)
-    if ex.head == :ref
-        # getindex
-        return Expr(:call, :(OffsetArrays.unsafe_getindex), newargs...)
-    end
-    Expr(ex.head, newargs...)
+    print(io, ')')
+    toplevel && print(io, " with eltype ", eltype(a))
 end
-
-@inline unsafe_getindex(a::AbstractArray, I...) = (@inbounds ret = a[I...]; ret)
-@inline unsafe_setindex!(a::AbstractArray, val, I...) = (@inbounds a[I...] = val; val)
-
-# Linear indexing
-@inline unsafe_getindex(a::OffsetArray, i::Int) = _unsafe_getindex(IndexStyle(a), a, i)
-@inline unsafe_setindex!(a::OffsetArray, val, i::Int) = _unsafe_setindex!(IndexStyle(a), a, val, i)
-for T in (IndexLinear, IndexCartesian)  # ambiguity-resolution requires specificity for both
-    @eval begin
-        @inline function _unsafe_getindex(::$T, a::OffsetVector, i::Int)
-            @inbounds ret = parent(a)[offset(a.offsets, (i,))[1]]
-            ret
-        end
-        @inline function _unsafe_setindex!(::$T, a::OffsetVector, val, i::Int)
-            @inbounds parent(a)[offset(a.offsets, (i,))[1]] = val
-            val
-        end
-    end
-end
-@inline function _unsafe_getindex(::IndexLinear, a::OffsetArray, i::Int)
-    @inbounds ret = parent(a)[i]
-    ret
-end
-@inline _unsafe_getindex(::IndexCartesian, a::OffsetArray, i::Int) =
-    unsafe_getindex(a, ind2sub(indices(a), i)...)
-@inline function _unsafe_setindex!(::IndexLinear, a::OffsetArray, val, i::Int)
-    @inbounds parent(a)[i] = val
-    val
-end
-@inline _unsafe_setindex!(::IndexCartesian, a::OffsetArray, val, i::Int) =
-    unsafe_setindex!(a, val, ind2sub(indices(a), i)...)
-
-@inline unsafe_getindex(a::OffsetArray, I::Int...) = unsafe_getindex(parent(a), offset(a.offsets, I)...)
-@inline unsafe_setindex!(a::OffsetArray, val, I::Int...) = unsafe_setindex!(parent(a), val, offset(a.offsets, I)...)
-@inline unsafe_getindex(a::OffsetArray, I...) = unsafe_getindex(a, Base.IteratorsMD.flatten(I)...)
-@inline unsafe_setindex!(a::OffsetArray, val, I...) = unsafe_setindex!(a, val, Base.IteratorsMD.flatten(I)...)
-
-# Indexing a SubArray which has OffsetArray indices
-OffsetSubArray{T,N,P,I<:Tuple{OffsetArray,Vararg{OffsetArray}}} = SubArray{T,N,P,I,false}
-@inline function unsafe_getindex(a::OffsetSubArray{T,N}, I::Vararg{Int,N}) where {T,N}
-    J = map(unsafe_getindex, a.indexes, I)
-    unsafe_getindex(parent(a), J...)
-end
-@inline function unsafe_setindex!(a::OffsetSubArray{T,N}, val, I::Vararg{Int,N}) where {T,N}
-    J = map(unsafe_getindex, a.indexes, I)
-    unsafe_setindex!(parent(a), val, J...)
-end
-@inline unsafe_getindex(a::OffsetSubArray, I::Union{Integer,CartesianIndex}...) = unsafe_getindex(a, Base.IteratorsMD.flatten(I)...)
-@inline unsafe_setindex!(a::OffsetSubArray, val, I::Union{Integer,CartesianIndex}...) = unsafe_setindex!(a, val, Base.IteratorsMD.flatten(I)...)
-
-if VERSION >= v"0.7.0-DEV.1790"
-    function Base.showarg(io::IO, a::OffsetArray, toplevel)
-        print(io, "OffsetArray(")
-        Base.showarg(io, parent(a), false)
-        if ndims(a) > 0
-            print(io, ", ")
-            printindices(io, indices(a)...)
-        end
-        print(io, ')')
-        toplevel && print(io, " with eltype ", eltype(a))
-    end
-    printindices(io::IO, ind1, inds...) =
-        (print(io, ind1, ", "); printindices(io, inds...))
-    printindices(io::IO, ind1) = print(io, ind1)
-end
+printindices(io::IO, ind1, inds...) =
+    (print(io, _unslice(ind1), ", "); printindices(io, inds...))
+printindices(io::IO, ind1) = print(io, _unslice(ind1))
+_unslice(x) = x
+_unslice(x::IdentityUnitRange) = x.indices
 
 end # module
